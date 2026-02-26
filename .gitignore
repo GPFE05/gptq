@@ -1,0 +1,17 @@
+# Python 字节码缓存
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE 配置
+.vscode/
+.idea/
+
+# 大模型权重文件（如果你以后下载了模型，建议也加上）
+*.bin
+*.pth
+*.onnx
