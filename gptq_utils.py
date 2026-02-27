@@ -12,6 +12,138 @@ torch.backends.cudnn.allow_tf32 = False
 
 DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
+# ---------------------------------------------------------------------------
+# MoE-aware helpers
+# ---------------------------------------------------------------------------
+
+# Routing-gate layer names that must NEVER be quantized (stay FP16/BF16)
+GATE_LAYER_NAMES = {'mlp.gate', 'mlp.shared_expert_gate'}
+
+
+def is_gate_layer(name: str) -> bool:
+    """Return True if *name* is an MoE routing gate that must stay in full precision."""
+    return name in GATE_LAYER_NAMES
+
+
+def build_sequential_for_layer(layer):
+    """
+    Dynamically build the sequential execution order for GPTQ quantization.
+    Returns a list of name-groups.  Each group shares the same calibration
+    forward pass; layers inside a group are then quantized individually.
+
+    Works for both dense (LLaMA / Qwen) and MoE (Qwen2MoE) decoder layers.
+    """
+    all_linear = quant_utils.find_qlayers(layer)
+    all_names = set(all_linear.keys())
+    is_moe = any('experts.' in n for n in all_names)
+
+    # --- Attention (common) ---
+    attn_qkv = sorted(
+        [n for n in all_names
+         if n in ('self_attn.q_proj', 'self_attn.k_proj', 'self_attn.v_proj')]
+    )
+    attn_o = [n for n in all_names if n == 'self_attn.o_proj']
+
+    sequential = []
+    if attn_qkv:
+        sequential.append(attn_qkv)
+    if attn_o:
+        sequential.append(attn_o)
+
+    # --- MLP / MoE ---
+    if is_moe:
+        # Group ALL expert + shared-expert up/gate projections together,
+        # then ALL down projections together.  This way a single calibration
+        # forward pass through the decoder layer collects Hessians for every
+        # expert simultaneously (each expert hook only fires for its routed
+        # tokens).  Gate layers are excluded.
+        mlp_up_gate = sorted([
+            n for n in all_names
+            if not is_gate_layer(n) and 'self_attn' not in n
+            and ('up_proj' in n or 'gate_proj' in n)
+        ])
+        mlp_down = sorted([
+            n for n in all_names
+            if not is_gate_layer(n) and 'self_attn' not in n
+            and 'down_proj' in n
+        ])
+        if mlp_up_gate:
+            sequential.append(mlp_up_gate)
+        if mlp_down:
+            sequential.append(mlp_down)
+    else:
+        mlp_up_gate = sorted(
+            [n for n in all_names if n in ('mlp.up_proj', 'mlp.gate_proj')]
+        )
+        mlp_down = [n for n in all_names if n == 'mlp.down_proj']
+        if mlp_up_gate:
+            sequential.append(mlp_up_gate)
+        if mlp_down:
+            sequential.append(mlp_down)
+
+    # Append any remaining quantizable linears for robustness
+    covered = {n for group in sequential for n in group}
+    for name in sorted(all_names):
+        if name in covered or is_gate_layer(name):
+            continue
+        sequential.append([name])
+
+    return sequential
+
+
+def get_layer_bits(name: str, args) -> int:
+    """
+    Determine the quantization bit-width for a given layer name.
+    Supports mixed-precision: independent bits for attention vs. expert layers.
+    """
+    if is_gate_layer(name):
+        return 16
+    if 'lm_head' in name:
+        return 16
+    if getattr(args, 'int8_down_proj', False) and 'down_proj' in name:
+        return 8
+    # MoE expert layers (including shared expert)
+    if 'experts.' in name or 'shared_expert.' in name:
+        return getattr(args, 'expert_bits', None) or args.w_bits
+    # Attention layers
+    if 'self_attn.' in name:
+        return getattr(args, 'attn_bits', None) or args.w_bits
+    return args.w_bits
+
+
+def _expand_kwargs_for_batch(kwargs, batch_size):
+    """Expand cached layer kwargs to match a larger batch dimension."""
+    if batch_size <= 1:
+        return kwargs
+    expanded = {}
+    for k, v in kwargs.items():
+        if isinstance(v, torch.Tensor):
+            if v.shape[0] == 1:
+                expanded[k] = v.expand(batch_size, *v.shape[1:])
+            else:
+                expanded[k] = v
+        elif isinstance(v, tuple):
+            expanded[k] = tuple(
+                t.expand(batch_size, *t.shape[1:])
+                if isinstance(t, torch.Tensor) and t.shape[0] == 1
+                else t
+                for t in v
+            )
+        else:
+            expanded[k] = v
+    return expanded
+
+
+def _batched_layer_forward(layer, inps, outs, batch_size, layer_kwargs):
+    """Forward pass through a decoder layer with configurable batch size."""
+    nsamples = inps.shape[0]
+    for j in range(0, nsamples, batch_size):
+        batch_end = min(j + batch_size, nsamples)
+        actual_bs = batch_end - j
+        expanded = _expand_kwargs_for_batch(layer_kwargs, actual_bs)
+        outs[j:batch_end] = layer(inps[j:batch_end], **expanded)[0]
+
+
 def llama_down_proj_groupsize(model, groupsize,logger):
     
     assert groupsize > 1, 'groupsize should be greater than 1!'
@@ -40,6 +172,7 @@ class GPTQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.nsamples = 0
+        self.token_count = 0
         self.logger = logger
 
     def add_batch(self, inp, out):
@@ -47,6 +180,10 @@ class GPTQ:
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
         tmp = inp.shape[0]
+        if len(inp.shape) == 3:
+            self.token_count += inp.shape[0] * inp.shape[1]
+        else:
+            self.token_count += inp.shape[0]
         if len(inp.shape) == 3:
             inp = inp.reshape((-1, inp.shape[-1]))
         inp = inp.t()
@@ -157,13 +294,19 @@ class GPTQ:
         
         
 @torch.no_grad()
-def gptq_fwrd(model, dataloader, dev, args,logger=None,omni_type=False,omni_wquant=False):
+def gptq_fwrd(model, dataloader, dev, args, logger=None):
     '''
-    From GPTQ repo 
-    TODO: Make this function general to support both OPT and LLaMA models
+    GPTQ quantization forward pass.
+    Supports both dense and MoE (Qwen2MoE) architectures with:
+      - Mixed-precision (separate attn_bits / expert_bits)
+      - MoE gate exemption
+      - Configurable calibration batch_size
+      - Per-layer statistics logging (bit-width & calibration token count)
     '''
     logger.info('-----GPTQ Quantization-----')
-    
+
+    batch_size = getattr(args, 'batch_size', 1)
+
     use_cache = model.config.use_cache
     model.config.use_cache = False
     layers = model.model.layers
@@ -176,7 +319,9 @@ def gptq_fwrd(model, dataloader, dev, args,logger=None,omni_type=False,omni_wqua
     inps = torch.zeros(
         (args.nsamples, 2048, model.config.hidden_size), dtype=dtype, device=dev
     )
-    cache = {'i': 0, 'attention_mask': None}
+
+    # Generic Catcher — captures all kwargs regardless of model architecture
+    cache = {'i': 0}
 
     class Catcher(nn.Module):
         def __init__(self, module):
@@ -185,10 +330,9 @@ def gptq_fwrd(model, dataloader, dev, args,logger=None,omni_type=False,omni_wqua
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            cache["position_embeddings"] = kwargs["position_embeddings"]
+            cache['kwargs'] = kwargs
             raise ValueError
+
     layers[0] = Catcher(layers[0])
     for batch in dataloader:
         try:
@@ -203,66 +347,79 @@ def gptq_fwrd(model, dataloader, dev, args,logger=None,omni_type=False,omni_wqua
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-    position_embeddings = cache["position_embeddings"]
+    layer_kwargs = cache.get('kwargs', {})          # reused for every layer
 
     quantizers = {}
-    sequential = [
-                ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
-                ['self_attn.o_proj'],
-                ['mlp.up_proj', 'mlp.gate_proj'],
-                ['mlp.down_proj']
-            ]
+
     for i in range(len(layers)):
-        print(f'\nLayer {i}:', flush=True, end=' ')
+        logger.info(f'\n=== Layer {i} ===')
         layer = layers[i].to(dev)
         full = quant_utils.find_qlayers(layer)
-        # import ipdb;ipdb.set_trace()
+
+        # Dynamically build the sequential execution order (dense or MoE)
+        sequential = build_sequential_for_layer(layer)
+
         for names in sequential:
-            subset = {n: full[n] for n in names}
+            subset = {n: full[n] for n in names if n in full}
+            if not subset:
+                continue
+
             gptq = {}
             for name in subset:
-                print(f'{name}', end='  ', flush=True)
-                layer_weight_bits = args.w_bits
+                layer_weight_bits = get_layer_bits(name, args)
                 layer_weight_sym = not(args.w_asym)
-                if 'lm_head' in name:
-                    layer_weight_bits = 16
+
+                if layer_weight_bits >= 16:
+                    logger.info(f'  {name}: skipped (bits={layer_weight_bits})')
                     continue
-                if args.int8_down_proj and 'down_proj' in name:
-                    layer_weight_bits = 8
-                gptq[name] = GPTQ(subset[name],logger=logger)
+
+                gptq[name] = GPTQ(subset[name], logger=logger)
                 gptq[name].quantizer = quant_utils.WeightQuantizer()
                 gptq[name].quantizer.configure(
-                    layer_weight_bits, perchannel=True, sym=layer_weight_sym, mse=args.w_clip
+                    layer_weight_bits, perchannel=True,
+                    sym=layer_weight_sym, mse=args.w_clip
                 )
 
+            if not gptq:
+                continue
+
+            # --- Register hooks to accumulate Hessian ---
             def add_batch(name):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
                 return tmp
+
             handles = []
-            for name in subset:
+            for name in gptq:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
-            for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids,position_embeddings=position_embeddings)[0]
+
+            # Batched calibration forward (configurable batch_size)
+            _batched_layer_forward(layer, inps, outs, batch_size, layer_kwargs)
+
             for h in handles:
                 h.remove()
 
-            for name in subset:
-                layer_w_groupsize = args.w_groupsize
+            # --- Quantize each layer & log statistics ---
+            for name in gptq:
+                layer_weight_bits = get_layer_bits(name, args)
                 gptq[name].fasterquant(
-                    percdamp=args.percdamp, groupsize=layer_w_groupsize, actorder=args.act_order, static_groups=False
+                    percdamp=args.percdamp,
+                    groupsize=args.w_groupsize,
+                    actorder=args.act_order,
+                    static_groups=False,
+                )
+                logger.info(
+                    f'  {name}: bits={layer_weight_bits}, '
+                    f'calibration_tokens={gptq[name].token_count}'
                 )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
                 gptq[name].free()
 
-        for j in range(args.nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids,position_embeddings=position_embeddings)[0]
+        # Final forward to propagate updated weights to next layer
+        _batched_layer_forward(layer, inps, outs, batch_size, layer_kwargs)
 
-        layers[i] = layer.cpu()  
+        layers[i] = layer.cpu()
         del layer
-        del gptq 
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
@@ -273,13 +430,14 @@ def gptq_fwrd(model, dataloader, dev, args,logger=None,omni_type=False,omni_wqua
     return quantizers
 
 @torch.no_grad()
-def rtn_fwrd(model, dev, args,logger,omni_wquant=False):
+def rtn_fwrd(model, dev, args, logger):
     '''
-    From GPTQ repo 
-    TODO: Make this function general to support both OPT and LLaMA models
+    RTN (Round-to-Nearest) quantization.
+    Supports both dense and MoE architectures with mixed-precision.
+    MoE routing gates are automatically excluded.
     '''
     logger.info('-----RTN Quantization-----')
-    assert args.w_groupsize ==-1, "Groupsize not supported in RTN!"
+    assert args.w_groupsize == -1, "Groupsize not supported in RTN!"
     layers = model.model.layers
     torch.cuda.empty_cache()
 
@@ -291,12 +449,16 @@ def rtn_fwrd(model, dev, args,logger,omni_wquant=False):
         subset = quant_utils.find_qlayers(layer)
 
         for name in subset:
-            layer_weight_bits = args.w_bits
-            if 'lm_head' in name:
-                layer_weight_bits = 16
+            # Skip MoE routing gates — must stay FP16/BF16
+            if is_gate_layer(name):
+                logger.info(f'  Layer {i} {name}: skipped (routing gate)')
                 continue
-            if args.int8_down_proj and 'down_proj' in name:
-                layer_weight_bits = 8
+
+            layer_weight_bits = get_layer_bits(name, args)
+
+            if layer_weight_bits >= 16:
+                logger.info(f'  Layer {i} {name}: skipped (bits={layer_weight_bits})')
+                continue
             
             W = subset[name].weight.data
             quantizer = quant_utils.WeightQuantizer()
@@ -308,6 +470,13 @@ def rtn_fwrd(model, dev, args,logger,omni_wquant=False):
             subset[name].weight.data = quantizer.quantize(W).to(
                 next(iter(layer.parameters())).dtype)
             quantizers['model.layers.%d.%s' % (i, name)] = quantizer.cpu()
+
+            # Log statistics
+            logger.info(
+                f'  Layer {i} {name}: bits={layer_weight_bits}, '
+                f'weight_params={W.numel()}'
+            )
+
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
         del layer

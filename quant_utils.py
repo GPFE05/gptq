@@ -3,7 +3,65 @@ import torch
 from tqdm import tqdm
 from datasets import load_dataset
 
+
+def _first_device_from_map(model):
+    if not hasattr(model, 'hf_device_map'):
+        return None
+
+    for _, value in model.hf_device_map.items():
+        if isinstance(value, int):
+            return torch.device(f'cuda:{value}')
+        if isinstance(value, str) and value.startswith('cuda'):
+            return torch.device(value)
+    return None
+
+
+def dispatch_model_for_eval(model, gpu_ids=(0, 1), no_split_module_classes=None, dtype=None):
+    """
+    Dispatch *model* across selected GPUs in-memory using ``accelerate``.
+    """
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return model
+
+    from accelerate import infer_auto_device_map, dispatch_model
+
+    if gpu_ids is None:
+        gpu_ids = tuple(range(min(2, torch.cuda.device_count())))
+    gpu_ids = tuple(gpu_ids)
+    if len(gpu_ids) == 0:
+        return model
+
+    max_memory = {}
+    for gpu_id in gpu_ids:
+        total_gib = torch.cuda.get_device_properties(gpu_id).total_memory // (1024 ** 3)
+        usable_gib = max(1, int(total_gib) - 1)
+        max_memory[gpu_id] = f"{usable_gib}GiB"
+    max_memory['cpu'] = '120GiB'
+
+    inferred_dtype = dtype if dtype is not None else next(model.parameters()).dtype
+    device_map = infer_auto_device_map(
+        model,
+        max_memory=max_memory,
+        no_split_module_classes=no_split_module_classes,
+        dtype=inferred_dtype,
+    )
+    model = dispatch_model(model, device_map=device_map)
+    return model
+
+
 def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="cuda"):
+    """
+    Evaluate perplexity.
+
+    Parameters
+    ----------
+    device : str
+        ``"cuda"``  – single-GPU evaluation (original behaviour).
+        ``"auto"``  – multi-GPU dispatch via *accelerate* (for large /
+                      MoE models that do not fit on one GPU).
+    """
+    multi_gpu = (device == "auto") or hasattr(model, 'hf_device_map')
+
     if datasets == "wikitext2":
         datasets = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     elif datasets == "c4":
@@ -21,7 +79,17 @@ def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="
     stride = seq_len
     max_length = input_ids.size(0)
 
-    model = model.to(device)
+    # ---- Device placement ----
+    if multi_gpu:
+        if not hasattr(model, 'hf_device_map'):
+            model = dispatch_model_for_eval(model)
+        input_device = _first_device_from_map(model)
+        if input_device is None:
+            input_device = next(model.parameters()).device
+    else:
+        model = model.to(device)
+        input_device = torch.device(device) if isinstance(device, str) else device
+
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
@@ -33,13 +101,13 @@ def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="
             end_loc = min(begin_loc + seq_len, max_length)
             trg_len = end_loc - prev_end_loc
 
-            input_chunk = input_ids[begin_loc:end_loc].unsqueeze(0).to(device)
+            input_chunk = input_ids[begin_loc:end_loc].unsqueeze(0).to(input_device)
             target_ids = input_chunk.clone()
             target_ids[:, :-trg_len] = -100
 
             outputs = model(input_chunk, labels=target_ids)
             neg_log_likelihood = outputs.loss
-            nlls.append(neg_log_likelihood)
+            nlls.append(neg_log_likelihood.cpu())   # always collect on CPU
 
             prev_end_loc = end_loc
             if end_loc == max_length:
@@ -47,8 +115,10 @@ def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="
 
     ppl = torch.exp(torch.stack(nlls).mean())
     model.config.use_cache = use_cache
-    model.to("cpu")
-    
+
+    if not multi_gpu:
+        model.to("cpu")
+
     return ppl
 
 
