@@ -3,7 +3,8 @@ import gptq_utils
 from quant_utils import create_logger
 
 def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikitext2",
-                    use_rtn=False, attn_bits=None, expert_bits=None, batch_size=1):
+                    use_rtn=False, attn_bits=None, expert_bits=None, batch_size=1,
+                    group_size=128, act_order=False):
     """
     Apply GPTQ or RTN quantization to a model.
 
@@ -18,6 +19,8 @@ def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikit
     attn_bits    : int | None  – bit-width for attention layers (None ⇒ w_bits).
     expert_bits  : int | None  – bit-width for MoE expert layers (None ⇒ w_bits).
     batch_size   : int         – batch size for calibration forward pass.
+    group_size   : int         – weight group size (-1 disables grouping).
+    act_order    : bool        – whether to enable activation-order permutation.
     """
     import argparse
     parser = argparse.ArgumentParser()
@@ -38,16 +41,22 @@ def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikit
     args.cal_dataset = cal_dataset
     args.nsamples = nsamples
 
-    args.w_groupsize = -1
+    args.w_groupsize = group_size
     args.w_asym = True
-    args.act_order = True
+    args.act_order = act_order
     args.percdamp = 0.01
+
+    if use_rtn and args.w_groupsize != -1:
+        logger.info('RTN does not support groupsize; forcing w_groupsize=-1.')
+        args.w_groupsize = -1
 
     logger.info(
         f'Quantization config: w_bits={w_bits}, '
         f'attn_bits={attn_bits or w_bits}, '
         f'expert_bits={expert_bits or w_bits}, '
-        f'batch_size={batch_size}'
+        f'batch_size={batch_size}, '
+        f'group_size={args.w_groupsize}, '
+        f'act_order={args.act_order}'
     )
 
     if args.w_bits < 16:
