@@ -40,7 +40,6 @@ def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikit
 
     args.w_groupsize = -1
     args.w_asym = True
-    args.int8_down_proj = True
     args.act_order = True
     args.percdamp = 0.01
 

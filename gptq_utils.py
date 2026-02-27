@@ -100,8 +100,6 @@ def get_layer_bits(name: str, args) -> int:
         return 16
     if 'lm_head' in name:
         return 16
-    if getattr(args, 'int8_down_proj', False) and 'down_proj' in name:
-        return 8
     # MoE expert layers (including shared expert)
     if 'experts.' in name or 'shared_expert.' in name:
         return getattr(args, 'expert_bits', None) or args.w_bits
