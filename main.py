@@ -15,7 +15,7 @@ from quant_utils import test_ppl
 # ---------------------------------------------------------------------------
 # Quantization configuration
 # ---------------------------------------------------------------------------
-wbits = 4  # default bit-width
+wbits = 2  # default bit-width
 attn_bits = 4  # attention layers (None → use wbits)
 expert_bits = 2  # MoE expert layers (None → use wbits)
 nsamples = 128
@@ -35,11 +35,11 @@ local_files_only = True  # 不触发下载，仅从本地缓存/本地目录读�
 
 model_name = model_path.split("/")[-1]
 save_root = Path(__file__).resolve().parent / "models"
-# save_path = str(
-#     save_root /
-#     f"{model_name}-gptq-w{wbits}-attn{attn_bits}-exp{expert_bits}-{cal_dataset}"
-# )
-save_path = None
+save_path = str(
+    save_root /
+    f"{model_name}-gptq-w{wbits}-attn{attn_bits}-exp{expert_bits}-{cal_dataset}"
+)
+#save_path = None
 save_root.mkdir(parents=True, exist_ok=True)
 
 tokenizer = AutoTokenizer.from_pretrained(

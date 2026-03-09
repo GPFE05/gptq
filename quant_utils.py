@@ -16,7 +16,19 @@ def _first_device_from_map(model):
     return None
 
 
-def dispatch_model_for_eval(model, gpu_ids=(0, 1), no_split_module_classes=None, dtype=None):
+def _device_map_has_cuda(model):
+    if not hasattr(model, 'hf_device_map'):
+        return False
+
+    for _, value in model.hf_device_map.items():
+        if isinstance(value, int):
+            return True
+        if isinstance(value, str) and value.startswith('cuda'):
+            return True
+    return False
+
+
+def dispatch_model_for_eval(model, gpu_ids=None, no_split_module_classes=None, dtype=None):
     """
     Dispatch *model* across selected GPUs in-memory using ``accelerate``.
     """
@@ -26,7 +38,7 @@ def dispatch_model_for_eval(model, gpu_ids=(0, 1), no_split_module_classes=None,
     from accelerate import infer_auto_device_map, dispatch_model
 
     if gpu_ids is None:
-        gpu_ids = tuple(range(min(2, torch.cuda.device_count())))
+        gpu_ids = tuple(range(torch.cuda.device_count()))
     gpu_ids = tuple(gpu_ids)
     if len(gpu_ids) == 0:
         return model
@@ -81,11 +93,17 @@ def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="
 
     # ---- Device placement ----
     if multi_gpu:
-        if not hasattr(model, 'hf_device_map'):
+        # `device_map="cpu"` also creates hf_device_map; do not mistake it as GPU-dispatched.
+        need_dispatch = (not hasattr(model, 'hf_device_map')) or (
+            device == "auto" and not _device_map_has_cuda(model)
+        )
+        if need_dispatch:
             model = dispatch_model_for_eval(model)
         input_device = _first_device_from_map(model)
         if input_device is None:
             input_device = next(model.parameters()).device
+        if device == "auto" and input_device.type != "cuda":
+            print("[test_ppl] warning: auto device dispatch did not place model on CUDA; evaluation will run on CPU.")
     else:
         model = model.to(device)
         input_device = torch.device(device) if isinstance(device, str) else device
