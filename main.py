@@ -18,6 +18,7 @@ from quant_utils import test_ppl
 wbits = 2  # default bit-width
 attn_bits = 4  # attention layers (None → use wbits)
 expert_bits = 2  # MoE expert layers (None → use wbits)
+test_fp16_ppl = True
 nsamples = 128
 batch_size = 80  # calibration batch size (> 1 speeds up Hessian collection)
 group_size = 128  # enabled by default; set -1 to disable
@@ -47,6 +48,30 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True,
     local_files_only=local_files_only,
 )
+
+if test_fp16_ppl:
+    print("Loading FP16 model with auto device map for evaluation...")
+    model_fp16 = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="auto",
+        torch_dtype=torch.float16,
+        local_files_only=local_files_only,
+    )
+    model_fp16.eval()
+
+    print("Evaluating FP16 model...")
+    ppl_fp16 = test_ppl(
+        model=model_fp16,
+        tokenizer=tokenizer,
+        datasets="wikitext2",
+        device=eval_device,
+    )
+    print(f"fp16 model wikitext2 ppl: {ppl_fp16}")
+
+    print("Releasing FP16 evaluation model...")
+    del model_fp16
+    gc.collect()
+    torch.cuda.empty_cache()
 
 # 1. 首次加载模型到 CPU 内存 (默认占用约 57GB FP32 空间)
 print("Loading model to CPU...")

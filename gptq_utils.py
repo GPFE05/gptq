@@ -353,6 +353,9 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
         logger.info(f'\n=== Layer {i} ===')
         layer = layers[i].to(dev)
         full = quant_utils.find_qlayers(layer)
+        discovered_linear_names = set(full.keys())
+        quantized_names = set()
+        skipped_names = set()
 
         # Dynamically build the sequential execution order (dense or MoE)
         sequential = build_sequential_for_layer(layer)
@@ -369,6 +372,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
 
                 if layer_weight_bits >= 16:
                     logger.info(f'  {name}: skipped (bits={layer_weight_bits})')
+                    skipped_names.add(name)
                     continue
 
                 gptq[name] = GPTQ(subset[name], logger=logger)
@@ -411,10 +415,20 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
                     f'calibration_tokens={gptq[name].token_count}'
                 )
                 quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
+                quantized_names.add(name)
                 gptq[name].free()
 
         # Final forward to propagate updated weights to next layer
         _batched_layer_forward(layer, inps, outs, batch_size, layer_kwargs)
+
+        unprocessed = sorted(discovered_linear_names - quantized_names - skipped_names)
+        logger.info(
+            f'  [coverage] discovered={len(discovered_linear_names)}, '
+            f'quantized={len(quantized_names)}, skipped={len(skipped_names)}, '
+            f'unprocessed={len(unprocessed)}'
+        )
+        if unprocessed:
+            logger.warning(f'  [coverage] unprocessed linear layers: {unprocessed}')
 
         layers[i] = layer.cpu()
         del layer
@@ -445,17 +459,22 @@ def rtn_fwrd(model, dev, args, logger):
         layer = layers[i].to(dev)
 
         subset = quant_utils.find_qlayers(layer)
+        discovered_linear_names = set(subset.keys())
+        quantized_names = set()
+        skipped_names = set()
 
         for name in subset:
             # Skip MoE routing gates — must stay FP16/BF16
             if is_gate_layer(name):
                 logger.info(f'  Layer {i} {name}: skipped (routing gate)')
+                skipped_names.add(name)
                 continue
 
             layer_weight_bits = get_layer_bits(name, args)
 
             if layer_weight_bits >= 16:
                 logger.info(f'  Layer {i} {name}: skipped (bits={layer_weight_bits})')
+                skipped_names.add(name)
                 continue
             
             W = subset[name].weight.data
@@ -468,12 +487,22 @@ def rtn_fwrd(model, dev, args, logger):
             subset[name].weight.data = quantizer.quantize(W).to(
                 next(iter(layer.parameters())).dtype)
             quantizers['model.layers.%d.%s' % (i, name)] = quantizer.cpu()
+            quantized_names.add(name)
 
             # Log statistics
             logger.info(
                 f'  Layer {i} {name}: bits={layer_weight_bits}, '
                 f'weight_params={W.numel()}'
             )
+
+        unprocessed = sorted(discovered_linear_names - quantized_names - skipped_names)
+        logger.info(
+            f'  Layer {i} [coverage]: discovered={len(discovered_linear_names)}, '
+            f'quantized={len(quantized_names)}, skipped={len(skipped_names)}, '
+            f'unprocessed={len(unprocessed)}'
+        )
+        if unprocessed:
+            logger.warning(f'  Layer {i} [coverage] unprocessed linear layers: {unprocessed}')
 
         layers[i] = layer.cpu()
         torch.cuda.empty_cache()
