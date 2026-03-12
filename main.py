@@ -18,7 +18,17 @@ from quant_utils import test_ppl
 wbits = 2  # default bit-width
 attn_bits = 2  # attention layers (None → use wbits)
 expert_bits = 2  # MoE expert layers (None → use wbits)
-test_fp16_ppl = True
+model_dtype_name = "float16"  # options: float16, bfloat16, float32
+MODEL_DTYPES = {
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+}
+if model_dtype_name not in MODEL_DTYPES:
+    raise ValueError(f"Unsupported model_dtype_name: {model_dtype_name}")
+model_dtype = MODEL_DTYPES[model_dtype_name]
+
+test_model_ppl = True
 nsamples = 128
 batch_size = 50  # calibration batch size (> 1 speeds up Hessian collection)
 group_size = 128  # enabled by default; set -1 to disable
@@ -51,36 +61,36 @@ tokenizer = AutoTokenizer.from_pretrained(
     local_files_only=local_files_only,
 )
 
-if test_fp16_ppl:
-    print("Loading FP16 model with auto device map for evaluation...")
-    model_fp16 = AutoModelForCausalLM.from_pretrained(
+if test_model_ppl:
+    print(f"Loading {model_dtype_name} model with auto device map for evaluation...")
+    model_eval = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map="auto",
-        torch_dtype=torch.float16,
+        torch_dtype=model_dtype,
         local_files_only=local_files_only,
     )
-    model_fp16.eval()
+    model_eval.eval()
 
-    print("Evaluating FP16 model...")
-    ppl_fp16 = test_ppl(
-        model=model_fp16,
+    print(f"Evaluating {model_dtype_name} model...")
+    ppl_eval = test_ppl(
+        model=model_eval,
         tokenizer=tokenizer,
         datasets="wikitext2",
         device=eval_device,
     )
-    print(f"fp16 model wikitext2 ppl: {ppl_fp16}")
+    print(f"{model_dtype_name} model wikitext2 ppl: {ppl_eval}")
 
-    print("Releasing FP16 evaluation model...")
-    del model_fp16
+    print(f"Releasing {model_dtype_name} evaluation model...")
+    del model_eval
     gc.collect()
     torch.cuda.empty_cache()
 
-# 1. 首次加载模型到 CPU 内存，统一使用 FP16 降低内存占用
+# 1. 首次加载模型到 CPU 内存，统一使用 model_dtype 降低内存占用
 print("Loading model to CPU...")
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
     device_map="cpu",
-    torch_dtype=torch.float16,
+    torch_dtype=model_dtype,
     local_files_only=local_files_only,
 )
 model.eval()
@@ -131,7 +141,7 @@ if save_path is not None:
     save_lm = AutoModelForCausalLM.from_pretrained(
         save_path,
         device_map="cpu",
-        torch_dtype=torch.float16,
+        torch_dtype=model_dtype,
         local_files_only=local_files_only,
     )
     ppl_quant_disk = test_ppl(model=save_lm, tokenizer=tokenizer, datasets="wikitext2", device=eval_device)
