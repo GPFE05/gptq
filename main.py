@@ -6,7 +6,7 @@ import torch
 windows_host = "http://child-prc.intel.com"
 os.environ["http_proxy"] = f"{windows_host}:913"
 os.environ["https_proxy"] = f"{windows_host}:913"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"  # two GPUs for MoE eval
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2"  # two GPUs for MoE eval
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -16,31 +16,33 @@ from quant_utils import test_ppl
 # Quantization configuration
 # ---------------------------------------------------------------------------
 wbits = 2  # default bit-width
-attn_bits = 4  # attention layers (None → use wbits)
+attn_bits = 2  # attention layers (None → use wbits)
 expert_bits = 2  # MoE expert layers (None → use wbits)
 test_fp16_ppl = True
 nsamples = 128
-batch_size = 80  # calibration batch size (> 1 speeds up Hessian collection)
+batch_size = 50  # calibration batch size (> 1 speeds up Hessian collection)
 group_size = 128  # enabled by default; set -1 to disable
 act_order = False
+force_all_tokens_to_all_experts = False
+use_last_visible_gpu_for_quant = False
 
-cal_dataset = "wikitext2"
+cal_dataset = "c4"
 # cal_dataset = "gsm8k"
 
 # ---------------------------------------------------------------------------
 # Model selection
 # ---------------------------------------------------------------------------
-model_path = "/home/kyyx/zyc/myomni/models/Qwen1.5-MoE-A2.7B"
+model_path = "Qwen/Qwen3-30B-A3B"
 eval_device = "auto"  # accelerate multi-GPU dispatch
 local_files_only = True  # 不触发下载，仅从本地缓存/本地目录读取
 
 model_name = model_path.split("/")[-1]
 save_root = Path(__file__).resolve().parent / "models"
-save_path = str(
-    save_root /
-    f"{model_name}-gptq-w{wbits}-attn{attn_bits}-exp{expert_bits}-{cal_dataset}"
-)
-#save_path = None
+# save_path = str(
+#     save_root /
+#     f"{model_name}-gptq-w{wbits}-attn{attn_bits}-exp{expert_bits}-{cal_dataset}"
+# )
+save_path = None
 save_root.mkdir(parents=True, exist_ok=True)
 
 tokenizer = AutoTokenizer.from_pretrained(
@@ -73,11 +75,12 @@ if test_fp16_ppl:
     gc.collect()
     torch.cuda.empty_cache()
 
-# 1. 首次加载模型到 CPU 内存 (默认占用约 57GB FP32 空间)
+# 1. 首次加载模型到 CPU 内存，统一使用 FP16 降低内存占用
 print("Loading model to CPU...")
 model = AutoModelForCausalLM.from_pretrained(
     model_path,
     device_map="cpu",
+    torch_dtype=torch.float16,
     local_files_only=local_files_only,
 )
 model.eval()
@@ -95,6 +98,8 @@ model_quant = gptq_for_model(
     batch_size=batch_size,
     group_size=group_size,
     act_order=act_order,
+    force_all_tokens_to_all_experts=force_all_tokens_to_all_experts,
+    use_last_visible_gpu_for_quant=use_last_visible_gpu_for_quant,
 )
 
 # --- Save quantized model ---
@@ -126,6 +131,7 @@ if save_path is not None:
     save_lm = AutoModelForCausalLM.from_pretrained(
         save_path,
         device_map="cpu",
+        torch_dtype=torch.float16,
         local_files_only=local_files_only,
     )
     ppl_quant_disk = test_ppl(model=save_lm, tokenizer=tokenizer, datasets="wikitext2", device=eval_device)

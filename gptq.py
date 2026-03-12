@@ -4,7 +4,9 @@ from quant_utils import create_logger
 
 def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikitext2",
                     use_rtn=False, attn_bits=None, expert_bits=None, batch_size=1,
-                    group_size=128, act_order=False):
+                    group_size=128, act_order=False,
+                    force_all_tokens_to_all_experts=False,
+                    use_last_visible_gpu_for_quant=False):
     """
     Apply GPTQ or RTN quantization to a model.
 
@@ -21,6 +23,8 @@ def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikit
     batch_size   : int         – batch size for calibration forward pass.
     group_size   : int         – weight group size (-1 disables grouping).
     act_order    : bool        – whether to enable activation-order permutation.
+    force_all_tokens_to_all_experts : bool – feed every token to every expert during GPTQ calibration.
+    use_last_visible_gpu_for_quant  : bool – place the active quantized block on the last visible GPU.
     """
     import argparse
     parser = argparse.ArgumentParser()
@@ -45,6 +49,10 @@ def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikit
     args.w_asym = True
     args.act_order = act_order
     args.percdamp = 0.01
+    args.force_all_tokens_to_all_experts = force_all_tokens_to_all_experts
+    args.use_last_visible_gpu_for_quant = use_last_visible_gpu_for_quant
+
+    quant_dev = gptq_utils.get_quant_device(use_last_visible_gpu_for_quant)
 
     if use_rtn and args.w_groupsize != -1:
         logger.info('RTN does not support groupsize; forcing w_groupsize=-1.')
@@ -56,13 +64,15 @@ def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikit
         f'expert_bits={expert_bits or w_bits}, '
         f'batch_size={batch_size}, '
         f'group_size={args.w_groupsize}, '
-        f'act_order={args.act_order}'
+        f'act_order={args.act_order}, '
+        f'force_all_tokens_to_all_experts={force_all_tokens_to_all_experts}, '
+        f'quant_device={quant_dev}'
     )
 
     if args.w_bits < 16:
         save_dict = {}        
         if use_rtn is True:
-            quantizers = gptq_utils.rtn_fwrd(model, gptq_utils.DEV, args, logger=logger)
+            quantizers = gptq_utils.rtn_fwrd(model, quant_dev, args, logger=logger)
             save_dict["w_quantizers"] = quantizers
         else:
             trainloader = gptq_utils.get_loaders(
@@ -70,7 +80,7 @@ def gptq_for_model(model, model_path, w_bits=4, nsamples=128, cal_dataset="wikit
                 seed=args.seed, model=args.model,
                 seqlen=2048, eval_mode=False
             )
-            quantizers = gptq_utils.gptq_fwrd(model, trainloader, gptq_utils.DEV, args, logger=logger)
+            quantizers = gptq_utils.gptq_fwrd(model, trainloader, quant_dev, args, logger=logger)
             save_dict["w_quantizers"] = quantizers
         
     return model

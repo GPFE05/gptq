@@ -10,7 +10,14 @@ import jsonlines
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
-DEV = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+def get_quant_device(use_last_visible_gpu: bool = False):
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return torch.device('cpu')
+    device_index = torch.cuda.device_count() - 1 if use_last_visible_gpu else 0
+    return torch.device(f'cuda:{device_index}')
+
+
+DEV = get_quant_device()
 
 # ---------------------------------------------------------------------------
 # MoE-aware helpers
@@ -23,6 +30,10 @@ GATE_LAYER_NAMES = {'mlp.gate', 'mlp.shared_expert_gate'}
 def is_gate_layer(name: str) -> bool:
     """Return True if *name* is an MoE routing gate that must stay in full precision."""
     return name in GATE_LAYER_NAMES
+
+
+def is_expert_layer(name: str) -> bool:
+    return 'experts.' in name
 
 
 def build_sequential_for_layer(layer):
@@ -156,6 +167,61 @@ def _batched_layer_forward(layer, inps, outs, batch_size, layer_args, layer_kwar
         expanded = _expand_kwargs_for_batch(layer_kwargs, actual_bs)
         layer_output = layer(inps[j:batch_end], *expanded_args, **expanded)
         outs[j:batch_end] = _get_primary_output(layer_output)
+
+
+def _collect_expert_modules(layer, subset_names):
+    named_modules = dict(layer.named_modules())
+    expert_module_names = []
+    for name in subset_names:
+        if not is_expert_layer(name):
+            continue
+        parent_name = name.rsplit('.', 1)[0]
+        if parent_name in named_modules and parent_name not in expert_module_names:
+            expert_module_names.append(parent_name)
+    return [named_modules[name] for name in sorted(expert_module_names)]
+
+
+def _batched_layer_forward_for_all_experts(
+    layer,
+    expert_modules,
+    inps,
+    outs,
+    batch_size,
+    layer_args,
+    layer_kwargs,
+    expert_hook_state,
+):
+    """Run the decoder layer normally, then replay every expert on all tokens for calibration only."""
+    nsamples = inps.shape[0]
+    captured = {'mlp_input': None}
+
+    def capture_mlp_input(_, args):
+        captured['mlp_input'] = args[0]
+
+    handle = layer.mlp.register_forward_pre_hook(capture_mlp_input)
+    try:
+        for j in range(0, nsamples, batch_size):
+            batch_end = min(j + batch_size, nsamples)
+            actual_bs = batch_end - j
+            expanded_args = _expand_args_for_batch(layer_args, actual_bs)
+            expanded = _expand_kwargs_for_batch(layer_kwargs, actual_bs)
+
+            captured['mlp_input'] = None
+            layer_output = layer(inps[j:batch_end], *expanded_args, **expanded)
+            outs[j:batch_end] = _get_primary_output(layer_output)
+
+            mlp_input = captured['mlp_input']
+            if mlp_input is None:
+                raise RuntimeError('Failed to capture MoE MLP inputs during calibration.')
+
+            expert_hook_state['enabled'] = True
+            try:
+                for expert_module in expert_modules:
+                    expert_module(mlp_input)
+            finally:
+                expert_hook_state['enabled'] = False
+    finally:
+        handle.remove()
 
 
 def llama_down_proj_groupsize(model, groupsize,logger):
@@ -320,6 +386,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
     logger.info('-----GPTQ Quantization-----')
 
     batch_size = getattr(args, 'batch_size', 1)
+    force_all_tokens_to_all_experts = getattr(args, 'force_all_tokens_to_all_experts', False)
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -383,6 +450,15 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
             if not subset:
                 continue
 
+            group_has_expert_layers = any(is_expert_layer(name) for name in subset)
+            expert_modules = []
+            if force_all_tokens_to_all_experts and group_has_expert_layers:
+                expert_modules = _collect_expert_modules(layer, subset.keys())
+                logger.info(
+                    f'  forcing all tokens through {len(expert_modules)} experts for calibration '
+                    f'(router-weighted layer output preserved)'
+                )
+
             gptq = {}
             for name in subset:
                 layer_weight_bits = get_layer_bits(name, args)
@@ -404,8 +480,12 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
                 continue
 
             # --- Register hooks to accumulate Hessian ---
+            expert_hook_state = {'enabled': not (force_all_tokens_to_all_experts and group_has_expert_layers)}
+
             def add_batch(name):
                 def tmp(_, inp, out):
+                    if not expert_hook_state['enabled']:
+                        return
                     gptq[name].add_batch(inp[0].data, _get_primary_output(out).data)
                 return tmp
 
@@ -414,7 +494,19 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
 
             # Batched calibration forward (configurable batch_size)
-            _batched_layer_forward(layer, inps, outs, batch_size, layer_args, layer_kwargs)
+            if force_all_tokens_to_all_experts and group_has_expert_layers and expert_modules:
+                _batched_layer_forward_for_all_experts(
+                    layer,
+                    expert_modules,
+                    inps,
+                    outs,
+                    batch_size,
+                    layer_args,
+                    layer_kwargs,
+                    expert_hook_state,
+                )
+            else:
+                _batched_layer_forward(layer, inps, outs, batch_size, layer_args, layer_kwargs)
 
             for h in handles:
                 h.remove()
