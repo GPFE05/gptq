@@ -109,37 +109,53 @@ def get_layer_bits(name: str, args) -> int:
     return args.w_bits
 
 
+def _get_primary_output(output):
+    """Return the hidden-state tensor from decoder layer outputs."""
+    if isinstance(output, (tuple, list)):
+        return output[0]
+    return output
+
+
+def _expand_cached_value(value, batch_size):
+    """Expand cached forward inputs to match a larger batch dimension when needed."""
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and value.shape[0] == 1:
+            return value.expand(batch_size, *value.shape[1:])
+        return value
+    if isinstance(value, tuple):
+        return tuple(_expand_cached_value(item, batch_size) for item in value)
+    if isinstance(value, list):
+        return [_expand_cached_value(item, batch_size) for item in value]
+    return value
+
+
 def _expand_kwargs_for_batch(kwargs, batch_size):
     """Expand cached layer kwargs to match a larger batch dimension."""
     if batch_size <= 1:
         return kwargs
     expanded = {}
     for k, v in kwargs.items():
-        if isinstance(v, torch.Tensor):
-            if v.shape[0] == 1:
-                expanded[k] = v.expand(batch_size, *v.shape[1:])
-            else:
-                expanded[k] = v
-        elif isinstance(v, tuple):
-            expanded[k] = tuple(
-                t.expand(batch_size, *t.shape[1:])
-                if isinstance(t, torch.Tensor) and t.shape[0] == 1
-                else t
-                for t in v
-            )
-        else:
-            expanded[k] = v
+        expanded[k] = _expand_cached_value(v, batch_size)
     return expanded
 
 
-def _batched_layer_forward(layer, inps, outs, batch_size, layer_kwargs):
+def _expand_args_for_batch(args, batch_size):
+    """Expand cached layer positional args to match a larger batch dimension."""
+    if batch_size <= 1:
+        return args
+    return tuple(_expand_cached_value(arg, batch_size) for arg in args)
+
+
+def _batched_layer_forward(layer, inps, outs, batch_size, layer_args, layer_kwargs):
     """Forward pass through a decoder layer with configurable batch size."""
     nsamples = inps.shape[0]
     for j in range(0, nsamples, batch_size):
         batch_end = min(j + batch_size, nsamples)
         actual_bs = batch_end - j
+        expanded_args = _expand_args_for_batch(layer_args, actual_bs)
         expanded = _expand_kwargs_for_batch(layer_kwargs, actual_bs)
-        outs[j:batch_end] = layer(inps[j:batch_end], **expanded)[0]
+        layer_output = layer(inps[j:batch_end], *expanded_args, **expanded)
+        outs[j:batch_end] = _get_primary_output(layer_output)
 
 
 def llama_down_proj_groupsize(model, groupsize,logger):
@@ -325,9 +341,10 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
         def __init__(self, module):
             super().__init__()
             self.module = module
-        def forward(self, inp, **kwargs):
+        def forward(self, inp, *args, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
+            cache['args'] = args
             cache['kwargs'] = kwargs
             raise ValueError
 
@@ -345,6 +362,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
+    layer_args = cache.get('args', ())
     layer_kwargs = cache.get('kwargs', {})          # reused for every layer
 
     quantizers = {}
@@ -388,7 +406,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
             # --- Register hooks to accumulate Hessian ---
             def add_batch(name):
                 def tmp(_, inp, out):
-                    gptq[name].add_batch(inp[0].data, out.data)
+                    gptq[name].add_batch(inp[0].data, _get_primary_output(out).data)
                 return tmp
 
             handles = []
@@ -396,7 +414,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
 
             # Batched calibration forward (configurable batch_size)
-            _batched_layer_forward(layer, inps, outs, batch_size, layer_kwargs)
+            _batched_layer_forward(layer, inps, outs, batch_size, layer_args, layer_kwargs)
 
             for h in handles:
                 h.remove()
@@ -419,7 +437,7 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
                 gptq[name].free()
 
         # Final forward to propagate updated weights to next layer
-        _batched_layer_forward(layer, inps, outs, batch_size, layer_kwargs)
+        _batched_layer_forward(layer, inps, outs, batch_size, layer_args, layer_kwargs)
 
         unprocessed = sorted(discovered_linear_names - quantized_names - skipped_names)
         logger.info(
