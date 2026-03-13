@@ -29,6 +29,28 @@ def _device_map_has_cuda(model):
     return False
 
 
+def get_no_split_module_classes(net):
+    """Return decoder-layer classes that must not be split across devices."""
+    net_name = (net or "").lower()
+    if "qwen3" in net_name and "moe" in net_name:
+        return ["Qwen3MoeDecoderLayer"]
+    return []
+
+
+def get_max_memory_map(usage_ratio=0.95):
+    """Build a per-GPU max-memory map from current free VRAM."""
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return {}
+
+    max_memory = {}
+    for gpu_id in range(torch.cuda.device_count()):
+        free_bytes, _ = torch.cuda.mem_get_info(gpu_id)
+        usable_bytes = int(free_bytes * usage_ratio)
+        usable_gib = max(1, usable_bytes // (1024 ** 3))
+        max_memory[gpu_id] = f"{usable_gib}GiB"
+    return max_memory
+
+
 def dispatch_model_for_eval(model, gpu_ids=None, no_split_module_classes=None, dtype=None):
     """
     Dispatch *model* across selected GPUs in-memory using ``accelerate``.
@@ -37,6 +59,7 @@ def dispatch_model_for_eval(model, gpu_ids=None, no_split_module_classes=None, d
         return model
 
     from accelerate import infer_auto_device_map, dispatch_model
+    from accelerate.utils import get_balanced_memory
 
     if gpu_ids is None:
         gpu_ids = tuple(range(torch.cuda.device_count()))
@@ -48,23 +71,32 @@ def dispatch_model_for_eval(model, gpu_ids=None, no_split_module_classes=None, d
     gc.collect()
     torch.cuda.empty_cache()
 
-    max_memory = {}
-    for gpu_id in gpu_ids:
-        free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
-        free_gib = int(free_bytes // (1024 ** 3))
-        total_gib = int(total_bytes // (1024 ** 3))
+    if no_split_module_classes is None:
+        model_name = getattr(getattr(model, "config", None), "_name_or_path", "")
+        no_split_module_classes = get_no_split_module_classes(model_name)
 
-        # Be conservative: leave extra room for hooks, activations and fragmentation.
-        by_total = max(1, total_gib - 6)
-        by_free = max(1, free_gib - 3)
-        usable_gib = min(by_total, by_free)
-        max_memory[gpu_id] = f"{usable_gib}GiB"
-    max_memory['cpu'] = '120GiB'
+    # Auto-add Qwen3 MoE decoder layer if present to avoid accidental split.
+    if "Qwen3MoeDecoderLayer" not in no_split_module_classes:
+        for module in model.modules():
+            if module.__class__.__name__ == "Qwen3MoeDecoderLayer":
+                no_split_module_classes = [*no_split_module_classes, "Qwen3MoeDecoderLayer"]
+                break
 
     inferred_dtype = dtype if dtype is not None else next(model.parameters()).dtype
+    selected_memory = get_max_memory_map(0.95)
+    if gpu_ids:
+        selected_memory = {k: v for k, v in selected_memory.items() if k in gpu_ids}
+
+    balanced_mem = get_balanced_memory(
+        model,
+        max_memory=selected_memory,
+        no_split_module_classes=no_split_module_classes,
+    )
+    logging.getLogger("GPTQ").info(f"Auto-balancing memory: {balanced_mem}")
+
     device_map = infer_auto_device_map(
         model,
-        max_memory=max_memory,
+        max_memory=balanced_mem,
         no_split_module_classes=no_split_module_classes,
         dtype=inferred_dtype,
     )
