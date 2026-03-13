@@ -1,4 +1,5 @@
 import logging
+import gc
 import torch
 from tqdm import tqdm
 from datasets import load_dataset
@@ -43,10 +44,20 @@ def dispatch_model_for_eval(model, gpu_ids=None, no_split_module_classes=None, d
     if len(gpu_ids) == 0:
         return model
 
+    # Clear stale allocator state before planning placement.
+    gc.collect()
+    torch.cuda.empty_cache()
+
     max_memory = {}
     for gpu_id in gpu_ids:
-        total_gib = torch.cuda.get_device_properties(gpu_id).total_memory // (1024 ** 3)
-        usable_gib = max(1, int(total_gib) - 1)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+        free_gib = int(free_bytes // (1024 ** 3))
+        total_gib = int(total_bytes // (1024 ** 3))
+
+        # Be conservative: leave extra room for hooks, activations and fragmentation.
+        by_total = max(1, total_gib - 6)
+        by_free = max(1, free_gib - 3)
+        usable_gib = min(by_total, by_free)
         max_memory[gpu_id] = f"{usable_gib}GiB"
     max_memory['cpu'] = '120GiB'
 

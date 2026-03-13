@@ -7,8 +7,15 @@ from quant_utils import cleanup_memory
 import quant_utils
 import jsonlines
 
-torch.backends.cuda.matmul.allow_tf32 = False
-torch.backends.cudnn.allow_tf32 = False
+if hasattr(torch.backends.cuda.matmul, 'fp32_precision'):
+    torch.backends.cuda.matmul.fp32_precision = 'ieee'
+else:
+    torch.backends.cuda.matmul.allow_tf32 = False
+
+if hasattr(torch.backends.cudnn, 'conv') and hasattr(torch.backends.cudnn.conv, 'fp32_precision'):
+    torch.backends.cudnn.conv.fp32_precision = 'ieee'
+else:
+    torch.backends.cudnn.allow_tf32 = False
 
 def get_quant_device(use_last_visible_gpu: bool = False):
     if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
