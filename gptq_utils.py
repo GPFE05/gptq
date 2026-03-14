@@ -531,9 +531,16 @@ def gptq_fwrd(model, dataloader, dev, args, logger=None):
                     f'  {name}: bits={layer_weight_bits}, '
                     f'calibration_tokens={gptq[name].token_count}'
                 )
-                quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer
+                # Keep persisted quantizer state on CPU to avoid long-lived GPU allocations.
+                quantizers['model.layers.%d.%s' % (i, name)] = gptq[name].quantizer.cpu()
                 quantized_names.add(name)
                 gptq[name].free()
+
+            # Release per-group references eagerly; MoE groups can be very large.
+            del handles
+            del gptq
+            del subset
+            cleanup_memory(verbos=False)
 
         # Final forward to propagate updated weights to next layer
         _batched_layer_forward(layer, inps, outs, batch_size, layer_args, layer_kwargs)
@@ -678,23 +685,46 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
         valenc = TokenizerWrapper(valenc)
         return valenc
     else:
+        # Stream C4 to avoid loading a massive Arrow table into host memory.
         traindata = datasets.load_dataset(
-            'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train')
-        
-        random.seed(seed)
+            'allenai/c4',
+            data_files={'train': 'en/c4-train.00000-of-01024.json.gz'},
+            split='train',
+            streaming=True,
+        )
+
+        rng = random.Random(seed)
+        stream = traindata.shuffle(seed=seed, buffer_size=10000)
         trainloader = []
-        for _ in range(nsamples):
-            while True:
-                i = random.randint(0, len(traindata) - 1)
-                trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
-                if trainenc.input_ids.shape[1] >= seqlen:
+        max_attempts = nsamples * 200
+        attempts = 0
+
+        for sample in stream:
+            attempts += 1
+            trainenc = tokenizer(sample['text'], return_tensors='pt')
+            if trainenc.input_ids.shape[1] < seqlen:
+                if attempts >= max_attempts:
                     break
-            i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-            j = i + seqlen
-            inp = trainenc.input_ids[:, i:j]
+                continue
+
+            start = rng.randint(0, trainenc.input_ids.shape[1] - seqlen)
+            end = start + seqlen
+            inp = trainenc.input_ids[:, start:end]
             tar = inp.clone()
             tar[:, :-1] = -100
             trainloader.append((inp, tar))
+
+            if len(trainloader) >= nsamples:
+                break
+            if attempts >= max_attempts:
+                break
+
+        if len(trainloader) < nsamples:
+            raise RuntimeError(
+                f'Insufficient C4 calibration samples: got {len(trainloader)} / {nsamples}. '
+                'Try reducing nsamples or seqlen.'
+            )
+
         return trainloader
 
     

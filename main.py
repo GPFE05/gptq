@@ -61,6 +61,14 @@ tokenizer = AutoTokenizer.from_pretrained(
     local_files_only=local_files_only,
 )
 
+
+def print_ppl_results(prefix, ppl_result):
+    if isinstance(ppl_result, dict):
+        print(f"{prefix} wikitext2 ppl: {ppl_result.get('wikitext2')}")
+        print(f"{prefix} c4 ppl: {ppl_result.get('c4')}")
+        return
+    print(f"{prefix} ppl: {ppl_result}")
+
 if test_model_ppl:
     print(f"Loading {model_dtype_name} model with auto device map for evaluation...")
     model_eval = AutoModelForCausalLM.from_pretrained(
@@ -75,10 +83,9 @@ if test_model_ppl:
     ppl_eval = test_ppl(
         model=model_eval,
         tokenizer=tokenizer,
-        datasets="wikitext2",
         device=eval_device,
     )
-    print(f"{model_dtype_name} model wikitext2 ppl: {ppl_eval}")
+    print_ppl_results(f"{model_dtype_name} model", ppl_eval)
 
     print(f"Releasing {model_dtype_name} evaluation model...")
     del model_eval
@@ -122,8 +129,8 @@ if save_path is not None:
 
 # --- Evaluate quantized model (In-memory) ---
 print("Evaluating in-memory quantized model...")
-ppl_quant = test_ppl(model=model_quant, tokenizer=tokenizer, datasets="wikitext2", device=eval_device)
-print(f"quant model wikitext2 ppl: {ppl_quant}")
+ppl_quant = test_ppl(model=model_quant, tokenizer=tokenizer, device=eval_device)
+print_ppl_results("quant model", ppl_quant)
 
 # ---------------------------------------------------------------------------
 # 3. 核心内存清理区：彻底摧毁庞大的 FP32 模型和量化中间态
@@ -144,8 +151,8 @@ if save_path is not None:
         torch_dtype=model_dtype,
         local_files_only=local_files_only,
     )
-    ppl_quant_disk = test_ppl(model=save_lm, tokenizer=tokenizer, datasets="wikitext2", device=eval_device)
-    print(f"quant model from disk wikitext2 ppl: {ppl_quant_disk}")
+    ppl_quant_disk = test_ppl(model=save_lm, tokenizer=tokenizer, device=eval_device)
+    print_ppl_results("quant model from disk", ppl_quant_disk)
 
     # 良好的代码习惯：脚本结尾也清理干净
     del save_lm

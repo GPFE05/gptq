@@ -104,7 +104,27 @@ def dispatch_model_for_eval(model, gpu_ids=None, no_split_module_classes=None, d
     return model
 
 
-def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="cuda"):
+def _load_eval_text(dataset_name):
+    dataset_name = dataset_name.lower()
+    if dataset_name == "wikitext2":
+        dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
+    elif dataset_name == "c4":
+        try:
+            dataset = load_dataset(
+                '/home/disk2/wsg/llm/bitnet-sliding/datasets/c4',
+                data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'},
+                split='validation'
+            )
+        except Exception:
+            # Fallback to HF-hosted C4 when local mirror is unavailable.
+            dataset = load_dataset("allenai/c4", "en", split="validation[:5%]")
+    else:
+        raise NotImplementedError("only support wikitext2 and c4")
+
+    return "\n\n".join(dataset["text"])
+
+
+def test_ppl(model, tokenizer, text_seq_len=2048, device="cuda"):
     """
     Evaluate perplexity.
 
@@ -115,24 +135,8 @@ def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="
         ``"auto"``  – multi-GPU dispatch via *accelerate* (for large /
                       MoE models that do not fit on one GPU).
     """
+    eval_datasets = ["wikitext2", "c4"]
     multi_gpu = (device == "auto") or hasattr(model, 'hf_device_map')
-
-    if datasets == "wikitext2":
-        datasets = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-    elif datasets == "c4":
-        datasets = load_dataset('/home/disk2/wsg/llm/bitnet-sliding/datasets/c4', 
-                                data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, 
-                                split='validation')
-    else:
-        raise NotImplementedError("only support wikitext2 and c4")
-
-    text = "\n\n".join(datasets["text"])
-    encodings = tokenizer(text, return_tensors="pt")
-    input_ids = encodings.input_ids[0]  # shape: [total_seq_len]
-
-    seq_len = text_seq_len
-    stride = seq_len
-    max_length = input_ids.size(0)
 
     # ---- Device placement ----
     if multi_gpu:
@@ -154,33 +158,46 @@ def test_ppl(model, tokenizer, datasets="wikitext2", text_seq_len=2048, device="
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
-    nlls = []
-    prev_end_loc = 0
+    results = {}
     with torch.no_grad():
         model.eval()
-        for begin_loc in tqdm(range(0, max_length - 1, stride)):
-            end_loc = min(begin_loc + seq_len, max_length)
-            trg_len = end_loc - prev_end_loc
+        for dataset_name in eval_datasets:
+            text = _load_eval_text(dataset_name)
+            encodings = tokenizer(text, return_tensors="pt")
+            input_ids = encodings.input_ids[0]  # shape: [total_seq_len]
 
-            input_chunk = input_ids[begin_loc:end_loc].unsqueeze(0).to(input_device)
-            target_ids = input_chunk.clone()
-            target_ids[:, :-trg_len] = -100
+            seq_len = text_seq_len
+            stride = seq_len
+            max_length = input_ids.size(0)
 
-            outputs = model(input_chunk, labels=target_ids)
-            neg_log_likelihood = outputs.loss
-            nlls.append(neg_log_likelihood.cpu())   # always collect on CPU
+            nlls = []
+            prev_end_loc = 0
+            for begin_loc in tqdm(range(0, max_length - 1, stride), desc=f"ppl:{dataset_name}"):
+                end_loc = min(begin_loc + seq_len, max_length)
+                trg_len = end_loc - prev_end_loc
 
-            prev_end_loc = end_loc
-            if end_loc == max_length:
-                break
+                input_chunk = input_ids[begin_loc:end_loc].unsqueeze(0).to(input_device)
+                target_ids = input_chunk.clone()
+                target_ids[:, :-trg_len] = -100
 
-    ppl = torch.exp(torch.stack(nlls).mean())
+                outputs = model(input_chunk, labels=target_ids)
+                neg_log_likelihood = outputs.loss
+                nlls.append(neg_log_likelihood.cpu())   # always collect on CPU
+
+                prev_end_loc = end_loc
+                if end_loc == max_length:
+                    break
+
+            results[dataset_name] = torch.exp(torch.stack(nlls).mean())
+
     model.config.use_cache = use_cache
 
     if not multi_gpu:
         model.to("cpu")
 
-    return ppl
+    if len(results) == 1:
+        return next(iter(results.values()))
+    return results
 
 
 def create_logger():
