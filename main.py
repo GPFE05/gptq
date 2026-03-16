@@ -51,6 +51,7 @@ def build_parser():
     parser.add_argument("--hf-endpoint", default="https://hf-mirror.com")
     parser.add_argument("--proxy-host", default="http://child-prc.intel.com")
     parser.add_argument("--proxy-port", type=int, default=913)
+    parser.add_argument("--log-dir", default="./logs")
     return parser
 
 
@@ -71,6 +72,8 @@ def apply_runtime_env(args):
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
     if args.hf_endpoint:
         os.environ["HF_ENDPOINT"] = args.hf_endpoint
+    if args.log_dir:
+        os.environ["GPTQ_LOG_DIR"] = args.log_dir
 
 
 def main():

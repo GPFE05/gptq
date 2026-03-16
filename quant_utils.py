@@ -1,5 +1,8 @@
 import logging
 import gc
+import os
+from datetime import datetime
+from pathlib import Path
 import torch
 from tqdm import tqdm
 from datasets import load_dataset
@@ -194,20 +197,33 @@ def test_ppl(model, tokenizer, text_seq_len=2048, device="cuda"):
 
 
 def create_logger():
-    # 创建一个 Logger 对象
     logger = logging.getLogger("GPTQ")
-    logger.setLevel(logging.DEBUG)  # 设置日志级别
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
-    # 创建一个 StreamHandler（输出到控制台）
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-
-    # 定义日志格式
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-    console_handler.setFormatter(formatter)
 
-    # 添加处理器到 logger
-    logger.addHandler(console_handler)
+    has_console = any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers)
+    has_file = any(isinstance(handler, logging.FileHandler) for handler in logger.handlers)
+
+    if not has_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.DEBUG)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
+    if not has_file:
+        log_dir = os.environ.get("GPTQ_LOG_DIR", "./logs")
+        log_path = Path(log_dir)
+        log_path.mkdir(parents=True, exist_ok=True)
+        log_file = log_path / f"gptq-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+        logger.info(f"Log file: {log_file.resolve()}")
 
     return logger
 
