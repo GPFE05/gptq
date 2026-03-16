@@ -109,15 +109,8 @@ def _load_eval_text(dataset_name):
     if dataset_name == "wikitext2":
         dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
     elif dataset_name == "c4":
-        try:
-            dataset = load_dataset(
-                '/home/disk2/wsg/llm/bitnet-sliding/datasets/c4',
-                data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'},
-                split='validation'
-            )
-        except Exception:
-            # Fallback to HF-hosted C4 when local mirror is unavailable.
-            dataset = load_dataset("allenai/c4", "en", split="validation[:5%]")
+        from gptq_utils import get_c4
+        _, dataset = get_c4(nsamples=0, seed=0, seqlen=0, model="", trust_remote_code=False)
     else:
         raise NotImplementedError("only support wikitext2 and c4")
 

@@ -642,6 +642,17 @@ import datasets
 import random
 import transformers
 
+
+def get_c4(nsamples, seed, seqlen, model, trust_remote_code=False):
+    print("get_c4")
+    traindata = datasets.load_dataset(
+        'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
+    )
+    valdata = datasets.load_dataset(
+        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
+    )
+    return traindata, valdata
+
 def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
     
     if hf_token is None:
@@ -674,9 +685,9 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
     else:
         tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, use_auth_token=hf_token)
 
+    traindata, valdata = get_c4(nsamples, seed, seqlen, model)
+
     if eval_mode:
-        valdata = datasets.load_dataset(
-        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation')
         valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
         valenc = valenc.input_ids[:, :(256 * seqlen)]
         class TokenizerWrapper:
@@ -685,26 +696,20 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
         valenc = TokenizerWrapper(valenc)
         return valenc
     else:
-        # Stream C4 to avoid loading a massive Arrow table into host memory.
-        traindata = datasets.load_dataset(
-            'allenai/c4',
-            data_files={'train': 'en/c4-train.00000-of-01024.json.gz'},
-            split='train',
-            streaming=True,
-        )
-
         rng = random.Random(seed)
-        stream = traindata.shuffle(seed=seed, buffer_size=10000)
         trainloader = []
-        max_attempts = nsamples * 200
+        max_attempts = max(nsamples * 200, 1)
         attempts = 0
+        data_size = len(traindata)
 
-        for sample in stream:
+        if data_size == 0:
+            raise RuntimeError('C4 train shard is empty.')
+
+        while len(trainloader) < nsamples and attempts < max_attempts:
             attempts += 1
+            sample = traindata[rng.randint(0, data_size - 1)]
             trainenc = tokenizer(sample['text'], return_tensors='pt')
             if trainenc.input_ids.shape[1] < seqlen:
-                if attempts >= max_attempts:
-                    break
                 continue
 
             start = rng.randint(0, trainenc.input_ids.shape[1] - seqlen)
@@ -713,11 +718,6 @@ def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
             tar = inp.clone()
             tar[:, :-1] = -100
             trainloader.append((inp, tar))
-
-            if len(trainloader) >= nsamples:
-                break
-            if attempts >= max_attempts:
-                break
 
         if len(trainloader) < nsamples:
             raise RuntimeError(
