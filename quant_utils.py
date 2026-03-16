@@ -5,7 +5,6 @@ from datetime import datetime
 from pathlib import Path
 import torch
 from tqdm import tqdm
-from datasets import load_dataset
 
 
 def _first_device_from_map(model):
@@ -107,17 +106,32 @@ def dispatch_model_for_eval(model, gpu_ids=None, no_split_module_classes=None, d
     return model
 
 
-def _load_eval_text(dataset_name):
+def _load_eval_input_ids(dataset_name, tokenizer, text_seq_len):
     dataset_name = dataset_name.lower()
-    if dataset_name == "wikitext2":
-        dataset = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")
-    elif dataset_name == "c4":
-        from gptq_utils import get_c4
-        _, dataset = get_c4(nsamples=0, seed=0, seqlen=0, model="", trust_remote_code=False)
-    else:
+    if dataset_name not in {"wikitext2", "c4"}:
         raise NotImplementedError("only support wikitext2 and c4")
 
-    return "\n\n".join(dataset["text"])
+    from gptq_utils import get_loaders
+
+    _, testloader = get_loaders(
+        dataset_name,
+        seed=0,
+        model=getattr(tokenizer, "name_or_path", ""),
+        seqlen=text_seq_len,
+        eval_mode=True,
+    )
+
+    # Keep the same branching style as the reference path:
+    # for C4 use the returned wrapper directly; others use tokenized ids.
+    if "c4" in dataset_name:
+        testenc = testloader
+    else:
+        testenc = testloader
+
+    if not hasattr(testenc, "input_ids"):
+        raise TypeError(f"Unexpected eval loader output for {dataset_name}: missing input_ids")
+
+    return testenc.input_ids[0]
 
 
 def test_ppl(model, tokenizer, text_seq_len=2048, device="cuda"):
@@ -158,9 +172,7 @@ def test_ppl(model, tokenizer, text_seq_len=2048, device="cuda"):
     with torch.no_grad():
         model.eval()
         for dataset_name in eval_datasets:
-            text = _load_eval_text(dataset_name)
-            encodings = tokenizer(text, return_tensors="pt")
-            input_ids = encodings.input_ids[0]  # shape: [total_seq_len]
+            input_ids = _load_eval_input_ids(dataset_name, tokenizer, text_seq_len)  # shape: [total_seq_len]
 
             seq_len = text_seq_len
             stride = seq_len

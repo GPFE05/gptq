@@ -651,7 +651,38 @@ def get_c4(nsamples, seed, seqlen, model, trust_remote_code=False):
     valdata = datasets.load_dataset(
         'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
     )
-    return traindata, valdata
+
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
+
+    random.seed(seed)
+    trainloader = []
+    for _ in range(nsamples):
+        while True:
+            i = random.randint(0, len(traindata) - 1)
+            trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
+            if trainenc.input_ids.shape[1] >= seqlen:
+                break
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
+
+    random.seed(0)
+    valenc = []
+    for _ in range(256):
+        while True:
+            i = random.randint(0, len(valdata) - 1)
+            tmp = tokenizer(valdata[i]['text'], return_tensors='pt')
+            if tmp.input_ids.shape[1] >= seqlen:
+                break
+        i = random.randint(0, tmp.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        valenc.append(tmp.input_ids[:, i:j])
+    valenc = torch.hstack(valenc)
+
+    return trainloader, valenc
 
 def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
     
@@ -679,53 +710,16 @@ def get_wikitext2(nsamples, seed, seqlen, model, hf_token, eval_mode=False):
         return trainloader
 
 def get_c4_new(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
-
-    if hf_token is None:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False)
-    else:
-        tokenizer = transformers.AutoTokenizer.from_pretrained(model, use_fast=False, use_auth_token=hf_token)
-
-    traindata, valdata = get_c4(nsamples, seed, seqlen, model)
+    trainloader, valenc = get_c4(nsamples, seed, seqlen, model)
 
     if eval_mode:
-        valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
-        valenc = valenc.input_ids[:, :(256 * seqlen)]
         class TokenizerWrapper:
             def __init__(self, input_ids):
                 self.input_ids = input_ids
-        valenc = TokenizerWrapper(valenc)
-        return valenc
-    else:
-        rng = random.Random(seed)
-        trainloader = []
-        max_attempts = max(nsamples * 200, 1)
-        attempts = 0
-        data_size = len(traindata)
 
-        if data_size == 0:
-            raise RuntimeError('C4 train shard is empty.')
+        return TokenizerWrapper(valenc)
 
-        while len(trainloader) < nsamples and attempts < max_attempts:
-            attempts += 1
-            sample = traindata[rng.randint(0, data_size - 1)]
-            trainenc = tokenizer(sample['text'], return_tensors='pt')
-            if trainenc.input_ids.shape[1] < seqlen:
-                continue
-
-            start = rng.randint(0, trainenc.input_ids.shape[1] - seqlen)
-            end = start + seqlen
-            inp = trainenc.input_ids[:, start:end]
-            tar = inp.clone()
-            tar[:, :-1] = -100
-            trainloader.append((inp, tar))
-
-        if len(trainloader) < nsamples:
-            raise RuntimeError(
-                f'Insufficient C4 calibration samples: got {len(trainloader)} / {nsamples}. '
-                'Try reducing nsamples or seqlen.'
-            )
-
-        return trainloader
+    return trainloader
 
     
 
