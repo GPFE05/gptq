@@ -36,11 +36,18 @@ GATE_LAYER_NAMES = {'mlp.gate', 'mlp.shared_expert_gate'}
 
 def is_gate_layer(name: str) -> bool:
     """Return True if *name* is an MoE routing gate that must stay in full precision."""
-    return name in GATE_LAYER_NAMES
+    if name in GATE_LAYER_NAMES:
+        return True
+    # Router naming varies across model families (e.g. nested gate/router modules).
+    if name.endswith('.gate') or name.endswith('.shared_expert_gate'):
+        return True
+    if '.router' in name:
+        return True
+    return False
 
 
 def is_expert_layer(name: str) -> bool:
-    return 'experts.' in name
+    return ('experts.' in name) or ('shared_expert' in name)
 
 
 def build_sequential_for_layer(layer):
@@ -118,8 +125,9 @@ def get_layer_bits(name: str, args) -> int:
         return 16
     if 'lm_head' in name:
         return 16
-    # MoE expert layers (including shared expert)
-    if 'experts.' in name or 'shared_expert.' in name:
+    # MoE expert layers (including shared expert variants such as
+    # `shared_expert.*` and `shared_experts.*` across model families)
+    if 'experts.' in name or 'shared_expert' in name:
         return getattr(args, 'expert_bits', None) or args.w_bits
     # Attention layers
     if 'self_attn.' in name:

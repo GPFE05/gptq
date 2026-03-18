@@ -449,8 +449,19 @@ class WeightQuantizer(torch.nn.Module):
 
 
 
+def _is_quantizable_linear_module(module, layers):
+    # Prefer explicit requested layer types, but also support custom linear-like
+    # modules that expose a 2D weight tensor and a forward method.
+    if any(isinstance(module, layer_type) for layer_type in layers):
+        return True
+    weight = getattr(module, 'weight', None)
+    if isinstance(weight, torch.Tensor) and weight.ndim == 2 and callable(getattr(module, 'forward', None)):
+        return True
+    return False
+
+
 def find_qlayers(module, layers=[torch.nn.Linear], name=''):
-    if type(module) in layers:
+    if _is_quantizable_linear_module(module, layers):
         return {name: module}
     res = {}
     for name1, child in module.named_children():
