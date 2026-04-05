@@ -1,6 +1,8 @@
 import argparse
 import os
 import gc
+import json
+import logging
 from pathlib import Path
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -52,7 +54,52 @@ def build_parser():
     parser.add_argument("--proxy-host", default="http://child-prc.intel.com")
     parser.add_argument("--proxy-port", type=int, default=913)
     parser.add_argument("--log-dir", default="./logs")
+    parser.add_argument("--tasks", default="")
+    parser.add_argument("--lm-eval-batch-size", default="auto")
+    parser.add_argument("--gen-kwargs", default=None)
+    parser.add_argument("--output-dir", default="./log_model")
     return parser
+
+
+def parse_gen_kwargs(gen_kwargs):
+    if gen_kwargs is None:
+        return None
+    if isinstance(gen_kwargs, dict):
+        return gen_kwargs
+    if isinstance(gen_kwargs, str):
+        value = gen_kwargs.strip()
+        if value == "":
+            return None
+        # Prefer JSON when supplied; otherwise pass through raw string to lm_eval.
+        if value.startswith("{") and value.endswith("}"):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+    return gen_kwargs
+
+
+def setup_logger(log_dir):
+    os.makedirs(log_dir, exist_ok=True)
+    logger = logging.getLogger("gptq_main")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    file_handler = logging.FileHandler(os.path.join(log_dir, "main.log"), encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    return logger
 
 
 def print_ppl_results(prefix, ppl_result):
@@ -79,6 +126,7 @@ def apply_runtime_env(args):
 def main():
     args = build_parser().parse_args()
     apply_runtime_env(args)
+    logger = setup_logger(args.log_dir)
 
     model_dtype = MODEL_DTYPES[args.model_dtype]
     save_root = Path(__file__).resolve().parent / "models"
@@ -153,6 +201,96 @@ def main():
     print("Evaluating in-memory quantized model...")
     ppl_quant = test_ppl(model=model_quant, tokenizer=tokenizer, device=args.eval_device)
     print_ppl_results("quant model", ppl_quant)
+
+    results = {}
+    if args.tasks != "":
+        task_list = args.tasks.split(",") if isinstance(args.tasks, str) else args.tasks
+        task_list = [task.strip() for task in task_list if str(task).strip()]
+
+        if task_list:
+            try:
+                import lm_eval
+                from lm_eval.models.huggingface import HFLM
+            except ImportError as exc:
+                raise RuntimeError(
+                    "lm_eval is required for --tasks evaluation. Please install it first."
+                ) from exc
+
+            try:
+                task_manager = lm_eval.tasks.TaskManager(
+                    include_path="./datasets_local/lm_eval_configs/tasks",
+                    include_defaults=True,
+                )
+            except Exception:
+                task_manager = lm_eval.tasks.TaskManager(include_defaults=True)
+
+            eval_batch_size = args.lm_eval_batch_size
+            if eval_batch_size is None or str(eval_batch_size).strip() == "":
+                eval_batch_size = "auto"
+
+            print(f"Initializing HFLM with batch_size={eval_batch_size}...")
+            hflm = HFLM(pretrained=model_quant, tokenizer=tokenizer, batch_size=eval_batch_size)
+
+            t_results = lm_eval.simple_evaluate(
+                model=hflm,
+                tasks=task_list,
+                batch_size=eval_batch_size,
+                task_manager=task_manager,
+                gen_kwargs=parse_gen_kwargs(args.gen_kwargs),
+            )["results"]
+
+            metric_vals = {}
+            for task, result in t_results.items():
+                metric_vals[task] = round(result.get("acc_norm,none", result.get("acc,none", 0)), 4)
+
+            print(f"Task Results: {metric_vals}")
+            from pprint import pprint
+
+            pprint(metric_vals)
+            results.update(metric_vals)
+
+            if metric_vals:
+                avg_task_score = round(sum(metric_vals.values()) / len(metric_vals), 4)
+                avg_msg = f"Task Average Score: {avg_task_score}"
+                print(avg_msg)
+                logger.info(avg_msg)
+                results["task_avg"] = avg_task_score
+
+            reported_metric_vals = {}
+            for key, value in metric_vals.items():
+                if "mmlu" in key:
+                    if key == "mmlu":
+                        reported_metric_vals[key] = value
+                else:
+                    reported_metric_vals[key] = value
+
+            import pandas as pd
+
+            os.makedirs(args.output_dir, exist_ok=True)
+            csv_path = f"{args.output_dir}/results.csv"
+
+            if os.path.exists(csv_path):
+                df = pd.read_csv(csv_path)
+                new_df = pd.DataFrame(reported_metric_vals, index=[0])
+                for col in new_df.columns:
+                    if col not in df.columns:
+                        df[col] = None
+                df = pd.concat([df, new_df], ignore_index=True)
+            else:
+                df = pd.DataFrame(reported_metric_vals, index=[0])
+
+            if len(task_list) >= 5:
+                cols = ["piqa", "arc_easy", "arc_challenge", "hellaswag", "winogrande"]
+                if all(col in df.columns for col in cols):
+                    df["avg-5"] = df[cols].mean(axis=1)
+            if len(task_list) >= 6:
+                cols = ["piqa", "arc_easy", "arc_challenge", "hellaswag", "winogrande", "boolq"]
+                if all(col in df.columns for col in cols):
+                    df["avg-6"] = df[cols].mean(axis=1)
+
+            print(f"Saving task results to {csv_path}...")
+            print(df)
+            df.to_csv(csv_path, index=False)
 
     print("Executing Garbage Collection...")
     del model
